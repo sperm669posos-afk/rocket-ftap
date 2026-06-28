@@ -1,0 +1,492 @@
+-- SHAHED | Fling Things and People | by vana
+-- GitHub: raw deploy, loadstring compatible
+-- Target: Roblox Luau, tested on Synapse X / KRNL / Fluxus
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+local Camera = Workspace.CurrentCamera
+
+local lp = Players.LocalPlayer
+local char = lp.Character or lp.CharacterAdded:Wait()
+local root = char:WaitForChild("HumanoidRootPart")
+
+-- ════════════════════════════════════════
+--  CONFIG
+-- ════════════════════════════════════════
+local CFG = {
+    speed       = 150,       -- studs/s, range 50-500
+    turnSpeed   = 2.5,       -- радиус поворота
+    fpvEnabled  = true,      -- FPV камера по умолчанию
+    rocketName  = "Rocket",  -- название модели ракеты в workspace
+}
+
+-- ════════════════════════════════════════
+--  STATE
+-- ════════════════════════════════════════
+local rocket       = nil
+local flying       = false
+local fpvConn      = nil
+local inputConn    = nil
+local gyroConn     = nil
+local originalCF   = nil
+local originalFOV  = Camera.FieldOfView
+
+-- ════════════════════════════════════════
+--  UTILITIES
+-- ════════════════════════════════════════
+local function findRocket()
+    -- ищем ракету по имени в workspace или в рюкзаке
+    for _, v in ipairs(Workspace:GetDescendants()) do
+        if v.Name == CFG.rocketName and v:IsA("BasePart") then
+            return v
+        end
+    end
+    -- fallback: ищем Tool с похожим именем
+    for _, tool in ipairs(lp.Backpack:GetChildren()) do
+        if tool.Name:lower():find("rocket") then
+            return tool:FindFirstChildWhichIsA("BasePart")
+        end
+    end
+    return nil
+end
+
+local function notify(msg)
+    local sg = Instance.new("ScreenGui", lp.PlayerGui)
+    sg.Name = "ShahedNotify"
+    sg.ResetOnSpawn = false
+    local f = Instance.new("Frame", sg)
+    f.Size = UDim2.new(0, 280, 0, 44)
+    f.Position = UDim2.new(0.5, -140, 0, 24)
+    f.BackgroundColor3 = Color3.fromRGB(15, 15, 22)
+    f.BorderSizePixel = 0
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
+    local stroke = Instance.new("UIStroke", f)
+    stroke.Color = Color3.fromRGB(99, 102, 241)
+    stroke.Thickness = 1
+    local lbl = Instance.new("TextLabel", f)
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3 = Color3.fromRGB(200, 200, 255)
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.Text = msg
+    game:GetService("Debris"):AddItem(sg, 3)
+end
+
+-- ════════════════════════════════════════
+--  SPAWN ROCKET
+-- ════════════════════════════════════════
+local function spawnRocket()
+    -- пробуем найти уже существующую
+    rocket = findRocket()
+    if rocket then
+        notify("☄️  Rocket found!")
+        return
+    end
+
+    -- если в игре есть RemoteEvent для спавна — стреляем в него
+    local remotes = Workspace:FindFirstChild("Remotes")
+        or game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    if remotes then
+        for _, re in ipairs(remotes:GetChildren()) do
+            if re.Name:lower():find("spawn") or re.Name:lower():find("rocket") then
+                re:FireServer()
+                task.wait(1.5)
+                rocket = findRocket()
+                if rocket then
+                    notify("☄️  Rocket spawned!")
+                    return
+                end
+            end
+        end
+    end
+
+    -- fallback: создаём визуальную ракету локально для FPV-демо
+    local part = Instance.new("Part")
+    part.Name = CFG.rocketName
+    part.Size = Vector3.new(1, 1, 4)
+    part.Shape = Enum.PartType.Cylinder
+    part.BrickColor = BrickColor.new("Medium stone grey")
+    part.Material = Enum.Material.Metal
+    part.CFrame = root.CFrame * CFrame.new(0, 2, -6)
+    part.Parent = Workspace
+    rocket = part
+    notify("☄️  Rocket spawned (local)!")
+end
+
+-- ════════════════════════════════════════
+--  FPV CAMERA
+-- ════════════════════════════════════════
+local function startFPV()
+    if not rocket then notify("⚠ No rocket") return end
+    CFG.fpvEnabled = true
+    Camera.CameraType = Enum.CameraType.Scriptable
+    Camera.FieldOfView = 80
+
+    fpvConn = RunService.RenderStepped:Connect(function()
+        if rocket and rocket.Parent then
+            -- камера сидит чуть позади кончика ракеты
+            local tipOffset = CFrame.new(0, 0.3, -1.8)
+            Camera.CFrame = rocket.CFrame * tipOffset
+        end
+    end)
+    notify("📡  FPV ON")
+end
+
+local function stopFPV()
+    if fpvConn then fpvConn:Disconnect() fpvConn = nil end
+    Camera.CameraType = Enum.CameraType.Custom
+    Camera.FieldOfView = originalFOV
+    notify("📡  FPV OFF")
+end
+
+-- ════════════════════════════════════════
+--  FLIGHT CONTROL
+-- ════════════════════════════════════════
+local vel   = nil  -- BodyVelocity
+local gyro  = nil  -- BodyGyro
+
+local function stopFlight()
+    flying = false
+    if inputConn then inputConn:Disconnect() inputConn = nil end
+    if gyroConn  then gyroConn:Disconnect()  gyroConn  = nil end
+    if vel  and vel.Parent  then vel:Destroy()  vel  = nil end
+    if gyro and gyro.Parent then gyro:Destroy() gyro = nil end
+    stopFPV()
+    notify("💥  Impact")
+end
+
+local function launchRocket()
+    if not rocket then
+        notify("⚠ Spawn rocket first!")
+        return
+    end
+    if flying then
+        stopFlight()
+        return
+    end
+
+    flying = true
+
+    -- физика
+    vel = Instance.new("BodyVelocity")
+    vel.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+    vel.Velocity  = rocket.CFrame.LookVector * CFG.speed
+    vel.Parent    = rocket
+
+    gyro = Instance.new("BodyGyro")
+    gyro.MaxTorque = Vector3.new(1e5, 1e5, 1e5)
+    gyro.P         = 3000
+    gyro.D         = 200
+    gyro.CFrame    = rocket.CFrame
+    gyro.Parent    = rocket
+
+    -- FPV автостарт
+    if CFG.fpvEnabled then startFPV() end
+
+    notify("🚀  Launched! W/A/S/D to steer")
+
+    -- ════ PC KEYBOARD INPUT ════
+    local pitch = 0
+    local yaw   = 0
+
+    inputConn = UserInputService.InputChanged:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseMovement then
+            -- мышь для поворота (альтернативно)
+        end
+    end)
+
+    -- ════ FLIGHT LOOP ════
+    gyroConn = RunService.Heartbeat:Connect(function(dt)
+        if not rocket or not rocket.Parent then
+            stopFlight()
+            return
+        end
+
+        -- читаем клавиши
+        local up    = UserInputService:IsKeyDown(Enum.KeyCode.W)
+        local down  = UserInputService:IsKeyDown(Enum.KeyCode.S)
+        local left  = UserInputService:IsKeyDown(Enum.KeyCode.A)
+        local right = UserInputService:IsKeyDown(Enum.KeyCode.D)
+
+        -- вычисляем дельту поворота
+        local dPitch = 0
+        local dYaw   = 0
+
+        if up    then dPitch = -CFG.turnSpeed * dt end
+        if down  then dPitch =  CFG.turnSpeed * dt end
+        if left  then dYaw   =  CFG.turnSpeed * dt end
+        if right then dYaw   = -CFG.turnSpeed * dt end
+
+        -- вращаем gyro
+        gyro.CFrame = gyro.CFrame
+            * CFrame.Angles(dPitch, dYaw, 0)
+
+        -- обновляем скорость по направлению ракеты
+        vel.Velocity = gyro.CFrame.LookVector * CFG.speed
+
+        -- двигаем ракету (если локальная)
+        if rocket:FindFirstChild("BodyVelocity") == nil then
+            rocket.CFrame = rocket.CFrame
+                + (gyro.CFrame.LookVector * CFG.speed * dt)
+        end
+    end)
+end
+
+-- ════════════════════════════════════════
+--  MOBILE GYROSCOPE SUPPORT
+-- ════════════════════════════════════════
+-- Roblox не даёт прямой доступ к гироскопу через Luau,
+-- но мы читаем TouchMoved для свайп-управления
+UserInputService.TouchMoved:Connect(function(touch, processed)
+    if not flying or not rocket then return end
+    local delta = touch.Delta
+    -- нормализуем дельту экрана → угол поворота
+    local dx = delta.X / 20   -- горизонталь → yaw
+    local dy = delta.Y / 20   -- вертикаль  → pitch
+    if gyro then
+        gyro.CFrame = gyro.CFrame * CFrame.Angles(-dy * 0.05, -dx * 0.05, 0)
+    end
+end)
+
+-- ════════════════════════════════════════
+--  GUI
+-- ════════════════════════════════════════
+local function buildGUI()
+    -- чистим старое
+    if lp.PlayerGui:FindFirstChild("ShahedGUI") then
+        lp.PlayerGui.ShahedGUI:Destroy()
+    end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "ShahedGUI"
+    sg.ResetOnSpawn = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = lp.PlayerGui
+
+    -- ── MAIN PANEL ──────────────────────────────────────
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.Size = UDim2.new(0, 220, 0, 310)
+    panel.Position = UDim2.new(0, 16, 0.5, -155)
+    panel.BackgroundColor3 = Color3.fromRGB(10, 10, 18)
+    panel.BorderSizePixel = 0
+    panel.Active = true
+    panel.Draggable = true
+    panel.Parent = sg
+
+    local corner = Instance.new("UICorner", panel)
+    corner.CornerRadius = UDim.new(0, 14)
+
+    local stroke = Instance.new("UIStroke", panel)
+    stroke.Color = Color3.fromRGB(60, 60, 90)
+    stroke.Thickness = 1
+
+    -- градиентная шапка
+    local header = Instance.new("Frame", panel)
+    header.Size = UDim2.new(1, 0, 0, 44)
+    header.BackgroundColor3 = Color3.fromRGB(20, 20, 35)
+    header.BorderSizePixel = 0
+    Instance.new("UICorner", header).CornerRadius = UDim.new(0, 14)
+
+    local grad = Instance.new("UIGradient", header)
+    grad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(99, 102, 241)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(168, 85, 247)),
+    })
+    grad.Rotation = 90
+
+    local title = Instance.new("TextLabel", header)
+    title.Size = UDim2.new(1, 0, 1, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "☄️  SHAHED"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    title.TextXAlignment = Enum.TextXAlignment.Center
+
+    -- ── LAYOUT ──────────────────────────────────────────
+    local layout = Instance.new("UIListLayout", panel)
+    layout.Padding = UDim.new(0, 6)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+    local pad = Instance.new("UIPadding", panel)
+    pad.PaddingTop    = UDim.new(0, 50)
+    pad.PaddingBottom = UDim.new(0, 10)
+    pad.PaddingLeft   = UDim.new(0, 10)
+    pad.PaddingRight  = UDim.new(0, 10)
+
+    -- ── BUTTON FACTORY ──────────────────────────────────
+    local function makeBtn(txt, order, accent)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, 42)
+        btn.BackgroundColor3 = accent or Color3.fromRGB(25, 25, 40)
+        btn.BorderSizePixel = 0
+        btn.Text = txt
+        btn.TextColor3 = Color3.fromRGB(210, 210, 255)
+        btn.Font = Enum.Font.Gotham
+        btn.TextSize = 12
+        btn.LayoutOrder = order
+        btn.Parent = panel
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 10)
+        local bs = Instance.new("UIStroke", btn)
+        bs.Color = Color3.fromRGB(70, 70, 110)
+        bs.Thickness = 1
+
+        btn.MouseEnter:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.15), {
+                BackgroundColor3 = Color3.fromRGB(40, 40, 65)
+            }):Play()
+        end)
+        btn.MouseLeave:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.15), {
+                BackgroundColor3 = accent or Color3.fromRGB(25, 25, 40)
+            }):Play()
+        end)
+        return btn
+    end
+
+    -- ── SPEED LABEL ─────────────────────────────────────
+    local speedLbl = Instance.new("TextLabel", panel)
+    speedLbl.Size = UDim2.new(1, 0, 0, 18)
+    speedLbl.BackgroundTransparency = 1
+    speedLbl.TextColor3 = Color3.fromRGB(130, 130, 180)
+    speedLbl.Font = Enum.Font.Gotham
+    speedLbl.TextSize = 11
+    speedLbl.Text = "Speed: " .. CFG.speed .. " studs/s"
+    speedLbl.LayoutOrder = 3
+
+    -- ── SPEED SLIDER ─────────────────────────────────────
+    local sliderFrame = Instance.new("Frame", panel)
+    sliderFrame.Size = UDim2.new(1, 0, 0, 20)
+    sliderFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 40)
+    sliderFrame.BorderSizePixel = 0
+    sliderFrame.LayoutOrder = 4
+    Instance.new("UICorner", sliderFrame).CornerRadius = UDim.new(0, 6)
+
+    local track = Instance.new("Frame", sliderFrame)
+    track.Size = UDim2.new(1, -12, 0, 4)
+    track.Position = UDim2.new(0, 6, 0.5, -2)
+    track.BackgroundColor3 = Color3.fromRGB(50, 50, 80)
+    track.BorderSizePixel = 0
+    Instance.new("UICorner", track).CornerRadius = UDim.new(0, 4)
+
+    local fill = Instance.new("Frame", track)
+    fill.Size = UDim2.new((CFG.speed - 50) / 450, 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(99, 102, 241)
+    fill.BorderSizePixel = 0
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(0, 4)
+
+    local knob = Instance.new("TextButton", track)
+    knob.Size = UDim2.new(0, 14, 0, 14)
+    knob.Position = UDim2.new((CFG.speed - 50) / 450, -7, 0.5, -7)
+    knob.BackgroundColor3 = Color3.fromRGB(99, 102, 241)
+    knob.BorderSizePixel = 0
+    knob.Text = ""
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(0.5, 0)
+
+    -- drag slider
+    local dragging = false
+    knob.MouseButton1Down:Connect(function() dragging = true end)
+    UserInputService.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+    UserInputService.InputChanged:Connect(function(inp)
+        if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then
+            local trackAbs = track.AbsolutePosition.X
+            local trackW   = track.AbsoluteSize.X
+            local rel = math.clamp((inp.Position.X - trackAbs) / trackW, 0, 1)
+            CFG.speed = math.floor(50 + rel * 450)
+            fill.Size = UDim2.new(rel, 0, 1, 0)
+            knob.Position = UDim2.new(rel, -7, 0.5, -7)
+            speedLbl.Text = "Speed: " .. CFG.speed .. " studs/s"
+            if vel then vel.Velocity = gyro and gyro.CFrame.LookVector * CFG.speed or vel.Velocity end
+        end
+    end)
+
+    -- touch slider support
+    knob.TouchPan:Connect(function(_, total, _, state)
+        local trackAbs = track.AbsolutePosition.X
+        local trackW   = track.AbsoluteSize.X
+        local rel = math.clamp((trackAbs + total.X) / trackW, 0, 1)
+        CFG.speed = math.floor(50 + rel * 450)
+        fill.Size = UDim2.new(rel, 0, 1, 0)
+        knob.Position = UDim2.new(rel, -7, 0.5, -7)
+        speedLbl.Text = "Speed: " .. CFG.speed .. " studs/s"
+    end)
+
+    -- ── BUTTONS ─────────────────────────────────────────
+    local btnSpawn  = makeBtn("🚀  Spawn Rocket",  1)
+    local btnLaunch = makeBtn("💥  Launch Rocket", 2)
+    local btnFPV    = makeBtn("📡  FPV Camera",    5)
+    local btnClose  = makeBtn("✕  Close",          6)
+
+    btnSpawn.MouseButton1Click:Connect(spawnRocket)
+    btnLaunch.MouseButton1Click:Connect(launchRocket)
+    btnFPV.MouseButton1Click:Connect(function()
+        if fpvConn then stopFPV() else startFPV() end
+    end)
+    btnClose.MouseButton1Click:Connect(function()
+        if flying then stopFlight() end
+        sg:Destroy()
+    end)
+
+    -- ── LANGUAGE TOGGLE ─────────────────────────────────
+    local langState = "EN"
+    local langBtn = Instance.new("TextButton", panel)
+    langBtn.Size = UDim2.new(0, 60, 0, 22)
+    langBtn.Position = UDim2.new(1, -68, 0, 11)
+    langBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 50)
+    langBtn.BorderSizePixel = 0
+    langBtn.Text = "EN · RU"
+    langBtn.TextColor3 = Color3.fromRGB(150, 150, 200)
+    langBtn.Font = Enum.Font.Gotham
+    langBtn.TextSize = 10
+    langBtn.ZIndex = 10
+    langBtn.Parent = sg  -- поверх панели, не внутри layout
+    langBtn.Position = UDim2.new(
+        panel.Position.X.Scale,
+        panel.Position.X.Offset + panel.Size.X.Offset - 68,
+        panel.Position.Y.Scale,
+        panel.Position.Y.Offset + 11
+    )
+    Instance.new("UICorner", langBtn).CornerRadius = UDim.new(0, 6)
+
+    local labels = {
+        EN = {
+            spawn  = "🚀  Spawn Rocket",
+            launch = "💥  Launch Rocket",
+            fpv    = "📡  FPV Camera",
+            close  = "✕  Close",
+            speed  = "Speed: ",
+        },
+        RU = {
+            spawn  = "🚀  Заспавнить ракету",
+            launch = "💥  Запустить ракету",
+            fpv    = "📡  FPV Камера",
+            close  = "✕  Закрыть",
+            speed  = "Скорость: ",
+        },
+    }
+
+    langBtn.MouseButton1Click:Connect(function()
+        langState = langState == "EN" and "RU" or "EN"
+        local l = labels[langState]
+        btnSpawn.Text  = l.spawn
+        btnLaunch.Text = l.launch
+        btnFPV.Text    = l.fpv
+        btnClose.Text  = l.close
+        speedLbl.Text  = l.speed .. CFG.speed .. " studs/s"
+        langBtn.Text   = langState == "EN" and "EN · RU" or "RU · EN"
+    end)
+end
+
+-- ════════════════════════════════════════
+--  INIT
+-- ════════════════════════════════════════
+buildGUI()
+notify("☄️  SHAHED loaded — Fling Things and People")
