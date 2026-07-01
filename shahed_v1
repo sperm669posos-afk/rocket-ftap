@@ -1,534 +1,326 @@
--- SHAHED v2 | Fling Things and People | Missile Edition
--- Fix: правильное имя "Missile", бесконечный спавн, без FPV кнопки
-
-local Players        = game:GetService("Players")
-local RunService     = game:GetService("RunService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local TweenService   = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace      = game:GetService("Workspace")
-local Camera         = Workspace.CurrentCamera
+local TweenService = game:GetService("TweenService")
 
-local lp   = Players.LocalPlayer
-local char = lp.Character or lp.CharacterAdded:Wait()
-local root = char:WaitForChild("HumanoidRootPart")
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
 
-lp.CharacterAdded:Connect(function(c)
-    char = c
-    root = c:WaitForChild("HumanoidRootPart")
-end)
-
-local CFG = {
-    speed     = 150,
-    turnSpeed = 2.2,
-    -- правильное имя из игры (wiki подтвердил)
-    missileName = "Missile",
-}
-
-local missile   = nil
-local flying    = false
-local fpvConn   = nil
-local gyroConn  = nil
-local vel       = nil
-local gyro      = nil
-local origFOV   = Camera.FieldOfView
-
--- ══════════════════════════════════════
---  NOTIFY
--- ══════════════════════════════════════
-local function notify(msg)
-    pcall(function()
-        if lp.PlayerGui:FindFirstChild("ShahedNotify") then
-            lp.PlayerGui.ShahedNotify:Destroy()
-        end
-    end)
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "ShahedNotify"
-    sg.ResetOnSpawn = false
-    sg.Parent = lp.PlayerGui
-
-    local f = Instance.new("Frame", sg)
-    f.Size = UDim2.new(0, 260, 0, 42)
-    f.Position = UDim2.new(0.5, -130, 0, 20)
-    f.BackgroundColor3 = Color3.fromRGB(12, 12, 20)
-    f.BorderSizePixel = 0
-    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
-    local stroke = Instance.new("UIStroke", f)
-    stroke.Color = Color3.fromRGB(99, 102, 241)
-    stroke.Thickness = 1
-
-    local lbl = Instance.new("TextLabel", f)
-    lbl.Size = UDim2.new(1, 0, 1, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.TextColor3 = Color3.fromRGB(200, 200, 255)
-    lbl.Font = Enum.Font.Gotham
-    lbl.TextSize = 13
-    lbl.Text = msg
-
-    game:GetService("Debris"):AddItem(sg, 3)
-end
-
--- ══════════════════════════════════════
---  FIND MISSILE  (ищем везде)
--- ══════════════════════════════════════
-local function findMissile()
-    -- 1. В workspace среди потомков (уже заспавненная)
-    for _, v in ipairs(Workspace:GetDescendants()) do
-        if v.Name == CFG.missileName and v:IsA("BasePart") then
-            return v
-        end
-        -- иногда это Model у которой PrimaryPart
-        if v.Name == CFG.missileName and v:IsA("Model") then
-            return v.PrimaryPart or v:FindFirstChildWhichIsA("BasePart")
+local function findRemote(names)
+    for _, name in ipairs(names) do
+        local r = ReplicatedStorage:FindFirstChild(name, true)
+        if r and r:IsA("RemoteEvent") then return r end
+    end
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") and obj.Name:lower():find("missile") then
+            return obj
         end
     end
-
-    -- 2. В рюкзаке (Tool)
-    for _, tool in ipairs(lp.Backpack:GetChildren()) do
-        if tool.Name:lower():find("missile") or tool.Name:lower():find("missle") then
-            return tool:FindFirstChildWhichIsA("BasePart") or tool.PrimaryPart
-        end
-    end
-
-    -- 3. В текущем character (Tool экипирован)
-    for _, tool in ipairs(char:GetChildren()) do
-        if tool:IsA("Tool") and (tool.Name:lower():find("missile") or tool.Name:lower():find("missle")) then
-            return tool:FindFirstChildWhichIsA("BasePart") or tool.PrimaryPart
-        end
-    end
-
     return nil
 end
 
--- ══════════════════════════════════════
---  SPAWN  (бесконечный, без лимита)
--- ══════════════════════════════════════
-local function spawnMissile()
-    -- каждый раз ищем заново — без кеша
-    missile = findMissile()
-    if missile and missile.Parent then
-        notify("☄️  Missile found — ready!")
-        return
-    end
+local SpawnRemote = findRemote({"SpawnMissile", "BuyMissile", "PurchaseMissile", "SpawnRocket"})
+local LaunchRemote = findRemote({"LaunchMissile", "FireMissile", "LaunchRocket"})
 
-    -- пробуем RemoteEvent спавна игры
-    local function tryRemote(parent)
-        if not parent then return false end
-        for _, re in ipairs(parent:GetDescendants()) do
-            if re:IsA("RemoteEvent") then
-                local n = re.Name:lower()
-                if n:find("spawn") or n:find("toy") or n:find("item") or n:find("missile") or n:find("missle") then
-                    pcall(function() re:FireServer(CFG.missileName) end)
-                    pcall(function() re:FireServer() end)
+local function hasMissile()
+    local ls = player:FindFirstChild("leaderstats")
+    if ls then
+        for _, stat in ipairs(ls:GetChildren()) do
+            local n = stat.Name:lower()
+            if n:find("coin") or n:find("cash") or n:find("money") then
+                if stat.Value < 1000 then return false end
+            end
+        end
+    end
+    for _, bag in ipairs({player.Backpack, player.Character}) do
+        if bag then
+            for _, it in ipairs(bag:GetChildren()) do
+                if it.Name:lower():find("missile") then return true end
+            end
+        end
+    end
+    return true
+end
+
+local function findActiveMissile()
+    local best = nil
+    local bestScore = -math.huge
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") or obj:IsA("Model") then
+            local n = obj.Name:lower()
+            if n:find("missile") or n:find("rocket") then
+                local root = obj:IsA("Model") and obj.PrimaryPart or obj
+                if root then
+                    local dist = player.Character and player.Character.PrimaryPart
+                        and (root.Position - player.Character.PrimaryPart.Position).Magnitude or 0
+                    local score = -dist + root.Position.Y
+                    if score > bestScore then
+                        bestScore = score
+                        best = obj
+                    end
                 end
             end
         end
-        return false
     end
-
-    tryRemote(ReplicatedStorage)
-    tryRemote(Workspace)
-
-    task.wait(1.2)
-    missile = findMissile()
-
-    if missile and missile.Parent then
-        notify("☄️  Missile spawned!")
-        return
-    end
-
-    -- Fallback: визуальная ракета-заглушка (красная, как настоящая)
-    local model = Instance.new("Model")
-    model.Name = CFG.missileName
-
-    local body = Instance.new("Part")
-    body.Name = "Body"
-    body.Size = Vector3.new(0.8, 0.8, 5)
-    body.BrickColor = BrickColor.new("Bright red")
-    body.Material = Enum.Material.SmoothPlastic
-    body.CFrame = root.CFrame * CFrame.new(0, 2, -7)
-    body.Parent = model
-
-    local nose = Instance.new("SpecialMesh", body)
-    nose.MeshType = Enum.MeshType.FileMesh
-    nose.MeshId = "rbxassetid://9064951980"
-    nose.Scale = Vector3.new(0.4, 0.4, 2)
-
-    local fin1 = Instance.new("Part")
-    fin1.Size = Vector3.new(0.1, 1.2, 0.8)
-    fin1.BrickColor = BrickColor.new("Bright red")
-    fin1.Material = Enum.Material.SmoothPlastic
-    fin1.CFrame = body.CFrame * CFrame.new(0, -0.6, 1.8)
-    fin1.Parent = model
-
-    local fin2 = fin1:Clone()
-    fin2.CFrame = body.CFrame * CFrame.new(0.6, 0, 1.8)
-    fin2.Size = Vector3.new(1.2, 0.1, 0.8)
-    fin2.Parent = model
-
-    local weld1 = Instance.new("WeldConstraint")
-    weld1.Part0 = body
-    weld1.Part1 = fin1
-    weld1.Parent = model
-
-    local weld2 = Instance.new("WeldConstraint")
-    weld2.Part0 = body
-    weld2.Part1 = fin2
-    weld2.Parent = model
-
-    model.PrimaryPart = body
-    model.Parent = Workspace
-    missile = body
-    notify("☄️  Missile ready (local)!")
+    return best
 end
 
--- ══════════════════════════════════════
---  FPV
--- ══════════════════════════════════════
-local function startFPV()
-    if not missile or not missile.Parent then return end
-    Camera.CameraType = Enum.CameraType.Scriptable
-    Camera.FieldOfView = 75
-    fpvConn = RunService.RenderStepped:Connect(function()
-        if missile and missile.Parent then
-            Camera.CFrame = missile.CFrame * CFrame.new(0, 0.2, -2.2)
-        end
-    end)
-end
+local flying = false
+local flightSpeed = 120
+local MAX_SPEED = 400
+local rocket = nil
+local bodyVel, bodyGyro = nil, nil
+local connections = {}
 
-local function stopFPV()
-    if fpvConn then fpvConn:Disconnect() fpvConn = nil end
-    Camera.CameraType = Enum.CameraType.Custom
-    Camera.FieldOfView = origFOV
-end
+local keysDown = {}
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    keysDown[input.KeyCode] = true
+end)
+UserInputService.InputEnded:Connect(function(input, gp)
+    if gp then return end
+    keysDown[input.KeyCode] = nil
+end)
 
--- ══════════════════════════════════════
---  FLIGHT
--- ══════════════════════════════════════
-local function stopFlight()
-    flying = false
-    if gyroConn then gyroConn:Disconnect() gyroConn = nil end
-    if vel  and vel.Parent  then vel:Destroy()  vel  = nil end
-    if gyro and gyro.Parent then gyro:Destroy() gyro = nil end
-    stopFPV()
-    notify("💥  Impact!")
-end
+local function startFlight(target)
+    if flying then return end
+    rocket = target
+    if not rocket then return end
 
-local function launchMissile()
-    if not missile or not missile.Parent then
-        notify("⚠  Spawn missile first!")
-        return
-    end
-    if flying then
-        stopFlight()
-        return
-    end
+    local root = rocket:IsA("Model") and rocket.PrimaryPart or rocket
+    if not root then return end
 
-    -- убираем Anchored если есть
-    missile.Anchored = false
-
+    camera.CameraType = Enum.CameraType.Scriptable
     flying = true
 
-    vel = Instance.new("BodyVelocity")
-    vel.MaxForce = Vector3.new(1e6, 1e6, 1e6)
-    vel.Velocity  = missile.CFrame.LookVector * CFG.speed
-    vel.Parent    = missile
+    bodyVel = Instance.new("BodyVelocity")
+    bodyVel.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bodyVel.Velocity = Vector3.zero
+    bodyVel.Parent = root
 
-    gyro = Instance.new("BodyGyro")
-    gyro.MaxTorque = Vector3.new(4e5, 4e5, 4e5)
-    gyro.P         = 5000
-    gyro.D         = 300
-    gyro.CFrame    = missile.CFrame
-    gyro.Parent    = missile
+    bodyGyro = Instance.new("BodyGyro")
+    bodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    bodyGyro.P = 1e5
+    bodyGyro.Parent = root
 
-    startFPV()
-    notify("🚀  Launched! W/A/S/D to steer")
-
-    gyroConn = RunService.Heartbeat:Connect(function(dt)
-        if not missile or not missile.Parent then
+    connections[#connections+1] = RunService.RenderStepped:Connect(function(dt)
+        if not flying or not rocket or not rocket.Parent then
             stopFlight()
             return
         end
+        local r = rocket:IsA("Model") and rocket.PrimaryPart or rocket
+        if not r then return end
 
-        local up    = UserInputService:IsKeyDown(Enum.KeyCode.W)
-        local down  = UserInputService:IsKeyDown(Enum.KeyCode.S)
-        local left  = UserInputService:IsKeyDown(Enum.KeyCode.A)
-        local right = UserInputService:IsKeyDown(Enum.KeyCode.D)
+        local fwd = camera.CFrame.LookVector
+        local right = camera.CFrame.RightVector
+        local up = Vector3.new(0, 1, 0)
 
-        local dPitch = 0
-        local dYaw   = 0
-        if up    then dPitch = -CFG.turnSpeed * dt end
-        if down  then dPitch =  CFG.turnSpeed * dt end
-        if left  then dYaw   =  CFG.turnSpeed * dt end
-        if right then dYaw   = -CFG.turnSpeed * dt end
+        local move = Vector3.zero
+        if keysDown[Enum.KeyCode.W] or keysDown[Enum.KeyCode.Up] then move = move + fwd end
+        if keysDown[Enum.KeyCode.S] or keysDown[Enum.KeyCode.Down] then move = move - fwd end
+        if keysDown[Enum.KeyCode.A] or keysDown[Enum.KeyCode.Left] then move = move - right end
+        if keysDown[Enum.KeyCode.D] or keysDown[Enum.KeyCode.Right] then move = move + right end
+        if keysDown[Enum.KeyCode.Space] then move = move + up end
+        if keysDown[Enum.KeyCode.LeftShift] then move = move - up end
 
-        gyro.CFrame = gyro.CFrame * CFrame.Angles(dPitch, dYaw, 0)
-        vel.Velocity = gyro.CFrame.LookVector * CFG.speed
+        if move.Magnitude > 0 then
+            move = move.Unit * math.clamp(flightSpeed, 10, MAX_SPEED)
+        end
+        bodyVel.Velocity = move
+        if move.Magnitude > 0 then
+            bodyGyro.CFrame = CFrame.lookAt(r.Position, r.Position + move)
+        end
+
+        local nose = r.CFrame * CFrame.new(0, 1.5, -3)
+        camera.CFrame = nose
     end)
+
+    if LaunchRemote then
+        pcall(function() LaunchRemote:FireServer(rocket) end)
+    end
 end
 
--- ══════════════════════════════════════
---  MOBILE SWIPE
--- ══════════════════════════════════════
-UserInputService.TouchMoved:Connect(function(touch)
-    if not flying or not missile or not missile.Parent then return end
-    local dx =  touch.Delta.X / 25
-    local dy =  touch.Delta.Y / 25
-    if gyro then
-        gyro.CFrame = gyro.CFrame * CFrame.Angles(-dy * 0.06, -dx * 0.06, 0)
+function stopFlight()
+    flying = false
+    camera.CameraType = Enum.CameraType.Custom
+    if bodyVel then bodyVel:Destroy() bodyVel = nil end
+    if bodyGyro then bodyGyro:Destroy() bodyGyro = nil end
+    for _, c in ipairs(connections) do c:Disconnect() end
+    connections = {}
+    rocket = nil
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "MissileUI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local trigger = Instance.new("ImageButton")
+trigger.Size = UDim2.fromOffset(48, 48)
+trigger.Position = UDim2.new(1, -70, 0, 20)
+trigger.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+trigger.AutoButtonColor = false
+trigger.Parent = gui
+
+local trigCorner = Instance.new("UICorner", trigger)
+trigCorner.CornerRadius = UDim.new(1, 0)
+local trigStroke = Instance.new("UIStroke", trigger)
+trigStroke.Color = Color3.fromRGB(120, 120, 140)
+trigStroke.Thickness = 1.5
+
+local trigIcon = Instance.new("TextLabel")
+trigIcon.Size = UDim2.fromScale(1, 1)
+trigIcon.BackgroundTransparency = 1
+trigIcon.Text = "🚀"
+trigIcon.TextScaled = true
+trigIcon.Font = Enum.Font.GothamBold
+trigIcon.Parent = trigger
+
+local menu = Instance.new("Frame")
+menu.Size = UDim2.fromOffset(260, 320)
+menu.Position = UDim2.new(0, 20, 0.5, -160)
+menu.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+menu.Visible = false
+menu.Parent = gui
+
+local mCorner = Instance.new("UICorner", menu)
+mCorner.CornerRadius = UDim.new(0, 12)
+local mStroke = Instance.new("UIStroke", menu)
+mStroke.Color = Color3.fromRGB(80, 80, 100)
+mStroke.Thickness = 1
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 40)
+title.BackgroundTransparency = 1
+title.Text = "MISSILE CONTROL"
+title.TextColor3 = Color3.fromRGB(240, 240, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.Parent = menu
+
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(0.9, 0, 0, 1)
+divider.Position = UDim2.new(0.05, 0, 0, 44)
+divider.BackgroundColor3 = Color3.fromRGB(60, 60, 75)
+divider.BorderSizePixel = 0
+divider.Parent = menu
+
+local function makeButton(text, yPos)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0.9, 0, 0, 42)
+    b.Position = UDim2.new(0.05, 0, 0, yPos)
+    b.BackgroundColor3 = Color3.fromRGB(32, 32, 40)
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(230, 230, 245)
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 14
+    b.AutoButtonColor = true
+    b.Parent = menu
+
+    local c = Instance.new("UICorner", b)
+    c.CornerRadius = UDim.new(0, 8)
+    local s = Instance.new("UIStroke", b)
+    s.Color = Color3.fromRGB(70, 70, 90)
+    s.Thickness = 1
+
+    b.MouseEnter:Connect(function() b.BackgroundColor3 = Color3.fromRGB(50, 50, 65) end)
+    b.MouseLeave:Connect(function() b.BackgroundColor3 = Color3.fromRGB(32, 32, 40) end)
+
+    return b
+end
+
+local btnSpawn = makeButton("Spawn Missile", 60)
+local btnLaunch = makeButton("Launch Missile", 112)
+local btnSpeed = makeButton("Speed: " .. flightSpeed, 164)
+local btnClose = makeButton("Close Menu", 258)
+
+local speedLabel = Instance.new("TextLabel")
+speedLabel.Size = UDim2.new(0.9, 0, 0, 18)
+speedLabel.Position = UDim2.new(0.05, 0, 0, 212)
+speedLabel.BackgroundTransparency = 1
+speedLabel.Text = "max " .. MAX_SPEED .. " studs/s"
+speedLabel.TextColor3 = Color3.fromRGB(140, 140, 160)
+speedLabel.Font = Enum.Font.Gotham
+speedLabel.TextSize = 12
+speedLabel.Parent = menu
+
+local function toast(msg)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.fromOffset(320, 50)
+    t.Position = UDim2.new(0.5, -160, 0.9, 0)
+    t.BackgroundColor3 = Color3.fromRGB(30, 10, 10)
+    t.Text = msg
+    t.TextColor3 = Color3.fromRGB(255, 120, 120)
+    t.Font = Enum.Font.GothamBold
+    t.TextSize = 15
+    t.Parent = gui
+    local c = Instance.new("UICorner", t)
+    c.CornerRadius = UDim.new(0, 10)
+    local s = Instance.new("UIStroke", t)
+    s.Color = Color3.fromRGB(200, 60, 60)
+
+    TweenService:Create(t, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, false, 2), {
+        BackgroundTransparency = 1, TextTransparency = 1
+    }):Play()
+    task.delay(2.5, function() t:Destroy() end)
+end
+
+local function toggleMenu(show)
+    menu.Visible = show
+    trigger.Visible = not show
+end
+
+btnSpawn.MouseButton1Click:Connect(function()
+    if not hasMissile() then
+        toast("you don't have it Missile :(")
+        return
+    end
+    if SpawnRemote then
+        pcall(function() SpawnRemote:FireServer() end)
+    else
+        for _, g in ipairs(player.PlayerGui:GetChildren()) do
+            local buy = g:FindFirstChild("BuyMissile", true)
+            if buy and buy:IsA("TextButton") then buy:Fire() break end
+        end
+    end
+    toast("missile spawned")
+end)
+
+btnLaunch.MouseButton1Click:Connect(function()
+    local m = findActiveMissile()
+    if not m then
+        toast("you don't have it Missile :(")
+        return
+    end
+    startFlight(m)
+end)
+
+btnSpeed.MouseButton1Click:Connect(function()
+    flightSpeed = flightSpeed + 40
+    if flightSpeed > MAX_SPEED then flightSpeed = 40 end
+    btnSpeed.Text = "Speed: " .. flightSpeed
+end)
+
+btnClose.MouseButton1Click:Connect(function()
+    toggleMenu(false)
+end)
+
+trigger.MouseButton1Click:Connect(function()
+    toggleMenu(true)
+end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.Escape and flying then
+        stopFlight()
     end
 end)
 
--- ══════════════════════════════════════
---  GUI
--- ══════════════════════════════════════
-local function buildGUI()
-    pcall(function()
-        if lp.PlayerGui:FindFirstChild("ShahedGUI") then
-            lp.PlayerGui.ShahedGUI:Destroy()
-        end
-    end)
+toggleMenu(true)
+print("[MissileScript] ready. remotes:", SpawnRemote and "spawn✓" or "spawn✗", LaunchRemote and "launch✓" or "launch✗")
+```
+</CODE>
 
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "ShahedGUI"
-    sg.ResetOnSpawn = false
-    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    sg.Parent = lp.PlayerGui
-
-    -- ── PANEL ───────────────────────────────────────────
-    local panel = Instance.new("Frame")
-    panel.Name = "Panel"
-    panel.Size = UDim2.new(0, 210, 0, 0)  -- высота авто
-    panel.Position = UDim2.new(0, 14, 0.5, -130)
-    panel.BackgroundColor3 = Color3.fromRGB(10, 10, 20)
-    panel.BorderSizePixel = 0
-    panel.Active = true
-    panel.Draggable = true
-    panel.AutomaticSize = Enum.AutomaticSize.Y
-    panel.Parent = sg
-    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 14)
-
-    local stroke = Instance.new("UIStroke", panel)
-    stroke.Color = Color3.fromRGB(55, 55, 90)
-    stroke.Thickness = 1
-
-    -- градиент шапка
-    local hdr = Instance.new("Frame", panel)
-    hdr.Size = UDim2.new(1, 0, 0, 46)
-    hdr.BackgroundColor3 = Color3.fromRGB(18, 18, 32)
-    hdr.BorderSizePixel = 0
-    Instance.new("UICorner", hdr).CornerRadius = UDim.new(0, 14)
-    local grad = Instance.new("UIGradient", hdr)
-    grad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(99, 102, 241)),
-        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(139, 92, 246)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(244, 63, 94)),
-    })
-    grad.Rotation = 45
-
-    local titleLbl = Instance.new("TextLabel", hdr)
-    titleLbl.Size = UDim2.new(1, -36, 1, 0)
-    titleLbl.Position = UDim2.new(0, 12, 0, 0)
-    titleLbl.BackgroundTransparency = 1
-    titleLbl.Text = "☄️  SHAHED"
-    titleLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
-    titleLbl.Font = Enum.Font.GothamBold
-    titleLbl.TextSize = 13
-    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
-
-    -- кнопка свернуть
-    local minBtn = Instance.new("TextButton", hdr)
-    minBtn.Size = UDim2.new(0, 28, 0, 28)
-    minBtn.Position = UDim2.new(1, -34, 0.5, -14)
-    minBtn.BackgroundColor3 = Color3.fromRGB(255,255,255)
-    minBtn.BackgroundTransparency = 0.85
-    minBtn.BorderSizePixel = 0
-    minBtn.Text = "—"
-    minBtn.TextColor3 = Color3.fromRGB(255,255,255)
-    minBtn.Font = Enum.Font.GothamBold
-    minBtn.TextSize = 14
-    Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
-
-    -- ── CONTENT FRAME ───────────────────────────────────
-    local content = Instance.new("Frame", panel)
-    content.Name = "Content"
-    content.Size = UDim2.new(1, 0, 0, 0)
-    content.BackgroundTransparency = 1
-    content.AutomaticSize = Enum.AutomaticSize.Y
-    content.Position = UDim2.new(0, 0, 0, 46)
-
-    local lay = Instance.new("UIListLayout", content)
-    lay.Padding = UDim.new(0, 6)
-    lay.SortOrder = Enum.SortOrder.LayoutOrder
-    lay.HorizontalAlignment = Enum.HorizontalAlignment.Center
-
-    local pad = Instance.new("UIPadding", content)
-    pad.PaddingLeft   = UDim.new(0, 10)
-    pad.PaddingRight  = UDim.new(0, 10)
-    pad.PaddingTop    = UDim.new(0, 8)
-    pad.PaddingBottom = UDim.new(0, 10)
-
-    -- ── BUTTON FACTORY ──────────────────────────────────
-    local function makeBtn(txt, order, r, g, b)
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, 0, 0, 40)
-        btn.BackgroundColor3 = Color3.fromRGB(r or 22, g or 22, b or 38)
-        btn.BorderSizePixel = 0
-        btn.Text = txt
-        btn.TextColor3 = Color3.fromRGB(210, 210, 255)
-        btn.Font = Enum.Font.Gotham
-        btn.TextSize = 12
-        btn.LayoutOrder = order
-        btn.Parent = content
-        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 10)
-        local bs = Instance.new("UIStroke", btn)
-        bs.Color = Color3.fromRGB(60, 60, 100)
-        bs.Thickness = 1
-
-        btn.MouseEnter:Connect(function()
-            TweenService:Create(btn, TweenInfo.new(0.15), {
-                BackgroundColor3 = Color3.fromRGB((r or 22)+20, (g or 22)+18, (b or 38)+22)
-            }):Play()
-        end)
-        btn.MouseLeave:Connect(function()
-            TweenService:Create(btn, TweenInfo.new(0.15), {
-                BackgroundColor3 = Color3.fromRGB(r or 22, g or 22, b or 38)
-            }):Play()
-        end)
-        return btn
-    end
-
-    -- ── SPEED ───────────────────────────────────────────
-    local speedLbl = Instance.new("TextLabel", content)
-    speedLbl.Size = UDim2.new(1, 0, 0, 16)
-    speedLbl.BackgroundTransparency = 1
-    speedLbl.TextColor3 = Color3.fromRGB(120, 120, 170)
-    speedLbl.Font = Enum.Font.Gotham
-    speedLbl.TextSize = 11
-    speedLbl.Text = "⚡ Speed: " .. CFG.speed .. " studs/s"
-    speedLbl.LayoutOrder = 3
-
-    local sliderOuter = Instance.new("Frame", content)
-    sliderOuter.Size = UDim2.new(1, 0, 0, 22)
-    sliderOuter.BackgroundColor3 = Color3.fromRGB(20, 20, 36)
-    sliderOuter.BorderSizePixel = 0
-    sliderOuter.LayoutOrder = 4
-    Instance.new("UICorner", sliderOuter).CornerRadius = UDim.new(0, 7)
-
-    local track = Instance.new("Frame", sliderOuter)
-    track.Size = UDim2.new(1, -14, 0, 4)
-    track.Position = UDim2.new(0, 7, 0.5, -2)
-    track.BackgroundColor3 = Color3.fromRGB(40, 40, 65)
-    track.BorderSizePixel = 0
-    Instance.new("UICorner", track).CornerRadius = UDim.new(0, 4)
-
-    local fill = Instance.new("Frame", track)
-    fill.Size = UDim2.new((CFG.speed-50)/450, 0, 1, 0)
-    fill.BackgroundColor3 = Color3.fromRGB(99, 102, 241)
-    fill.BorderSizePixel = 0
-    Instance.new("UICorner", fill).CornerRadius = UDim.new(0, 4)
-
-    local knob = Instance.new("TextButton", track)
-    knob.Size = UDim2.new(0, 14, 0, 14)
-    knob.Position = UDim2.new((CFG.speed-50)/450, -7, 0.5, -7)
-    knob.BackgroundColor3 = Color3.fromRGB(99, 102, 241)
-    knob.BorderSizePixel = 0
-    knob.Text = ""
-    Instance.new("UICorner", knob).CornerRadius = UDim.new(0.5, 0)
-
-    local dragging = false
-    knob.MouseButton1Down:Connect(function() dragging = true end)
-    UserInputService.InputEnded:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
-    end)
-    UserInputService.InputChanged:Connect(function(inp)
-        if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then
-            local rel = math.clamp((inp.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-            CFG.speed = math.floor(50 + rel * 450)
-            fill.Size = UDim2.new(rel, 0, 1, 0)
-            knob.Position = UDim2.new(rel, -7, 0.5, -7)
-            speedLbl.Text = "⚡ Speed: " .. CFG.speed .. " studs/s"
-            if vel then vel.Velocity = (gyro and gyro.CFrame.LookVector or Vector3.new(0,0,-1)) * CFG.speed end
-        end
-    end)
-
-    -- ── LANG TOGGLE ─────────────────────────────────────
-    local langState = "EN"
-    local labels = {
-        EN = { spawn = "🚀  Spawn Missile", launch = "💥  Launch Missile", speed = "⚡ Speed: " },
-        RU = { spawn = "🚀  Заспавнить ракету", launch = "💥  Запустить ракету", speed = "⚡ Скорость: " },
-    }
-
-    local langBtn = Instance.new("TextButton")
-    langBtn.Size = UDim2.new(0, 56, 0, 20)
-    langBtn.Position = UDim2.new(1, -64, 0, 13)
-    langBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 48)
-    langBtn.BorderSizePixel = 0
-    langBtn.Text = "EN · RU"
-    langBtn.TextColor3 = Color3.fromRGB(130, 130, 190)
-    langBtn.Font = Enum.Font.Gotham
-    langBtn.TextSize = 10
-    langBtn.ZIndex = 12
-    langBtn.Parent = panel
-    Instance.new("UICorner", langBtn).CornerRadius = UDim.new(0, 6)
-
-    -- ── BUTTONS ─────────────────────────────────────────
-    local btnSpawn  = makeBtn("🚀  Spawn Missile",  1)
-    local btnLaunch = makeBtn("💥  Launch Missile", 2)
-
-    btnSpawn.MouseButton1Click:Connect(spawnMissile)
-    btnLaunch.MouseButton1Click:Connect(launchMissile)
-
-    langBtn.MouseButton1Click:Connect(function()
-        langState = langState == "EN" and "RU" or "EN"
-        local l = labels[langState]
-        btnSpawn.Text  = l.spawn
-        btnLaunch.Text = l.launch
-        speedLbl.Text  = l.speed .. CFG.speed .. " studs/s"
-        langBtn.Text   = langState == "EN" and "EN · RU" or "RU · EN"
-        titleLbl.Text  = langState == "EN" and "☄️  SHAHED" or "☄️  ШАХЕД"
-    end)
-
-    -- ── MINIMIZE / RESTORE ──────────────────────────────
-    local minimized = false
-    local floatBtn  = nil
-
-    minBtn.MouseButton1Click:Connect(function()
-        minimized = true
-        panel.Visible = false
-
-        floatBtn = Instance.new("TextButton", sg)
-        floatBtn.Size = UDim2.new(0, 54, 0, 54)
-        floatBtn.Position = UDim2.new(0, 14, 0.5, -27)
-        floatBtn.BackgroundColor3 = Color3.fromRGB(14, 14, 26)
-        floatBtn.BorderSizePixel = 0
-        floatBtn.Text = "☄️"
-        floatBtn.TextSize = 26
-        floatBtn.Font = Enum.Font.GothamBold
-        floatBtn.ZIndex = 20
-        Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 14)
-        local fstroke = Instance.new("UIStroke", floatBtn)
-        fstroke.Color = Color3.fromRGB(99, 102, 241)
-        fstroke.Thickness = 1.5
-
-        -- пульсация
-        local pulseTween = TweenService:Create(fstroke, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
-            Thickness = 2.5
-        })
-        pulseTween:Play()
-
-        floatBtn.MouseButton1Click:Connect(function()
-            pulseTween:Cancel()
-            floatBtn:Destroy()
-            floatBtn = nil
-            minimized = false
-            panel.Visible = true
-        end)
-    end)
-end
-
--- ══════════════════════════════════════
---  INIT
--- ══════════════════════════════════════
-buildGUI()
-notify("☄️  SHAHED v2 loaded — Fling Things and People")
+<CODE>
